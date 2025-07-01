@@ -4,24 +4,29 @@ const dotenv = require("dotenv");
 require("dotenv").config();
 const app = express();
 const port = process.env.PORT || 3000;
+
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const e = require("express");
 const admin = require("firebase-admin");
 
 dotenv.config();
+
+// Stripe for payments
 const stripe = require("stripe")(process.env.PAYMENT_GATEWAY_KEY);
 
-// Middleware
+// Middleware: Enable CORS for cross-origin requests & parse JSON bodies
 app.use(cors());
 app.use(express.json());
 
+// Initialize Firebase Admin SDK for verifying Firebase auth tokens
 const serviceAccount = require("./firebase-admin-key.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+// MongoDB connection URI
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.b5ecy6m.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0`;
 
+// Create a new MongoClient for connecting to MongoDB
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -30,42 +35,50 @@ const client = new MongoClient(uri, {
   },
 });
 
+// Main async function to connect and set up routes
 async function run() {
   try {
+    // Connect to MongoDB
     await client.connect();
 
+    // Get database and collections
     const db = client.db("parcelDB");
     const parcelCollection = db.collection("parcels");
     const paymentCollection = db.collection("payments");
     const trackingsCollection = db.collection("trackings");
     const usersCollection = db.collection("users");
+    const ridersCollection = db.collection("riders");
 
-    // custom middleware: verify Firebase ID token
+    /*
+      Custom middleware to verify Firebase ID Token.
+      This middleware extracts the token from the `Authorization` header,
+      verifies it with Firebase Admin SDK, and attaches decoded info to req.
+      If token missing or invalid, it returns 401 or 403 error.
+    */
     const verifyFBToken = async (req, res, next) => {
-      const authHeader = req.headers.authorization;
-
+       const authHeader = req.headers.authorization;
       if (!authHeader) {
         return res.status(401).send({ message: "Unauthorized access" });
       }
 
-      const token = authHeader.split(" ")[1];
-
+       const token = authHeader.split(" ")[1];
       if (!token) {
         return res.status(401).send({ message: "Unauthorized access" });
       }
 
-      try {
-        // verify Firebase ID token
+       try {
         const decoded = await admin.auth().verifyIdToken(token);
         req.decoded = decoded;
-        next(); // proceed to next middleware or route
+        next(); // Token valid, proceed
       } catch (error) {
         console.error("Token verification failed:", error);
         return res.status(403).send({ message: "Forbidden access" });
       }
     };
 
-    // POST /users
+    /* -------------- USER ROUTES -------------- */
+
+    // POST /users - Create a new user if email not exists
     app.post("/users", async (req, res) => {
       try {
         const email = req.body.email;
@@ -90,14 +103,44 @@ async function run() {
       }
     });
 
-    // GET parcels (all or filtered by email)
-    app.get("/parcels", async (req, res) => {
+    // PATCH /users/:id - Update user profile by MongoDB ObjectId
+    app.patch("/users/:id", async (req, res) => {
+      const { id } = req.params;
+      const updatedFields = req.body;
+
+      // Validate ID format
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid user ID" });
+      }
+
+      try {
+        // Update fields in the user document
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updatedFields }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send(result);
+      } catch (error) {
+        console.error("Error updating user:", error);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+
+    /* -------------- PARCEL ROUTES -------------- */
+
+    // GET /parcels - Get parcels; if query param email present, filter by email
+    app.get("/parcels", verifyFBToken, async (req, res) => {
       try {
         const userEmail = req.query.email;
         const query = userEmail ? { email: userEmail } : {};
         const parcels = await parcelCollection
           .find(query)
-          .sort({ creation_timestamp: -1 }) // sort latest first
+          .sort({ creation_timestamp: -1 }) // newest first
           .toArray();
         res.send(parcels);
       } catch (error) {
@@ -106,7 +149,7 @@ async function run() {
       }
     });
 
-    // POST new parcel
+    // POST /parcels - Add new parcel document
     app.post("/parcels", async (req, res) => {
       try {
         const newParcel = req.body;
@@ -119,10 +162,11 @@ async function run() {
       }
     });
 
-    // GET a single parcel by ID
+    // GET /parcels/:id - Get parcel by MongoDB ObjectId
     app.get("/parcels/:id", async (req, res) => {
       try {
         const id = req.params.id;
+
         if (!ObjectId.isValid(id)) {
           return res.status(400).send({ message: "Invalid parcel ID" });
         }
@@ -142,7 +186,7 @@ async function run() {
       }
     });
 
-    // DELETE parcel by ID
+    // DELETE /parcels/:id - Delete parcel by ID
     app.delete("/parcels/:id", async (req, res) => {
       try {
         const id = req.params.id;
@@ -162,7 +206,9 @@ async function run() {
       }
     });
 
-    // payment success
+    /* -------------- PAYMENT ROUTES -------------- */
+
+    // POST /create-payment-intent - Create Stripe payment intent
     app.post("/create-payment-intent", async (req, res) => {
       const amountInCents = req.body.amount;
       try {
@@ -177,22 +223,21 @@ async function run() {
       }
     });
 
-    /* ───────── POST  /payments ─ record a payment & mark parcel as paid ───────── */
+    // POST /payments - Record payment and update parcel status in a MongoDB transaction
     app.post("/payments", async (req, res) => {
       const { parcelId, email, amount, paymentMethod, transactionId } =
         req.body;
 
-      /* 1. basic validation */
+      // Validate parcelId and amount
       if (!ObjectId.isValid(parcelId))
         return res.status(400).json({ message: "Invalid parcel ID" });
       if (!amount || amount <= 0)
         return res.status(400).json({ message: "Amount must be > 0" });
 
-      /* 2. run both writes inside a MongoDB transaction */
       const session = client.startSession();
       try {
         await session.withTransaction(async () => {
-          /* a. update the parcel */
+          // a. Update parcel payment status
           const parcelUpdate = await parcelCollection.updateOne(
             { _id: new ObjectId(parcelId) },
             {
@@ -207,7 +252,7 @@ async function run() {
           if (parcelUpdate.matchedCount === 0)
             throw new Error("Parcel not found or already removed");
 
-          /* b. insert a payment‑history record */
+          // b. Insert payment record
           await paymentCollection.insertOne(
             {
               parcelId: new ObjectId(parcelId),
@@ -232,7 +277,9 @@ async function run() {
       }
     });
 
-    /* ─────── Create tracking update ─────── */
+    /* -------------- TRACKING ROUTES -------------- */
+
+    // POST /trackings - Create a tracking update record
     app.post("/trackings", async (req, res) => {
       const {
         tracking_id,
@@ -268,7 +315,9 @@ async function run() {
       }
     });
 
-    /* ───────── GET  /payment-history ─ newest first, optional user filter ───────── */
+    /* -------------- PAYMENT HISTORY ROUTE -------------- */
+
+    // GET /payments - Get payment history, optionally filtered by email; requires Firebase token
     app.get("/payments", verifyFBToken, async (req, res) => {
       try {
         const { email } = req.query;
@@ -286,6 +335,82 @@ async function run() {
       }
     });
 
+    /* -------------- RIDER ROUTES -------------- */
+
+    // POST /riders - Rider application submission
+    app.post("/riders", async (req, res) => {
+      try {
+        const { email } = req.body;
+
+        if (!email) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        // Check if user already applied
+        const existing = await ridersCollection.findOne({ email });
+        if (existing) {
+          return res.status(200).json({
+            message: "You have already applied",
+            inserted: false,
+          });
+        }
+
+        const riderDoc = {
+          ...req.body,
+          status: "pending",
+          submittedAt: new Date(),
+        };
+
+        const result = await ridersCollection.insertOne(riderDoc);
+        res.status(201).json({
+          message: "Application submitted",
+          inserted: true,
+          insertedId: result.insertedId,
+        });
+      } catch (error) {
+        console.error("Error submitting rider application:", error);
+        res.status(500).json({ message: "Failed to submit application" });
+      }
+    });
+
+    // GET /riders - Get riders filtered by status
+    app.get("/riders", async (req, res) => {
+      const { status } = req.query;
+      const filter = status ? { status } : {};
+      const result = await ridersCollection.find(filter).toArray();
+      res.send(result);
+    });
+
+    // PATCH /riders/approve/:id - Approve a rider by ID
+    app.patch("/riders/approve/:id", async (req, res) => {
+      const id = req.params.id;
+      const result = await ridersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status: "approved", approvedAt: new Date() } }
+      );
+      res.send(result);
+    });
+
+    // ✅ NEW: GET /users/:uid - Fetch user by Firebase UID
+    app.get("/users/:id", async (req, res) => {
+      const uid = req.params.uid;
+
+      try {
+        const user = await usersCollection.findOne({ uid });
+
+        if (!user) {
+          return res.status(404).send({ message: "User not found" });
+        }
+
+        res.send(user);
+      } catch (error) {
+        console.error("Error fetching user:", error);
+        res.status(500).send({ message: "Internal server error" });
+      }
+    });
+   
+
+    // MongoDB connection test
     await client.db("admin").command({ ping: 1 });
     console.log("Connected to MongoDB successfully!");
   } catch (error) {
@@ -294,10 +419,12 @@ async function run() {
 }
 run().catch(console.dir);
 
+// Basic root endpoint to verify server is running
 app.get("/", (req, res) => {
   res.send("Parcel server is running!");
 });
 
+// Start server on defined port
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
