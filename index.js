@@ -56,17 +56,17 @@ async function run() {
       If token missing or invalid, it returns 401 or 403 error.
     */
     const verifyFBToken = async (req, res, next) => {
-       const authHeader = req.headers.authorization;
+      const authHeader = req.headers.authorization;
       if (!authHeader) {
         return res.status(401).send({ message: "Unauthorized access" });
       }
 
-       const token = authHeader.split(" ")[1];
+      const token = authHeader.split(" ")[1];
       if (!token) {
         return res.status(401).send({ message: "Unauthorized access" });
       }
 
-       try {
+      try {
         const decoded = await admin.auth().verifyIdToken(token);
         req.decoded = decoded;
         next(); // Token valid, proceed
@@ -384,11 +384,34 @@ async function run() {
     // PATCH /riders/approve/:id - Approve a rider by ID
     app.patch("/riders/approve/:id", async (req, res) => {
       const id = req.params.id;
-      const result = await ridersCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status: "approved", approvedAt: new Date() } }
-      );
-      res.send(result);
+      const { email } = req.body;
+      try {
+        // Approve the rider
+        const riderResult = await ridersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          {
+            $set: {
+              status: "approved",
+              approvedAt: new Date(),
+            },
+          }
+        );
+        // If rider was approved, also update the user role
+        if (email) {
+          const userQuery = { email };
+          const userUpdateDoc = {
+            $set: {
+              role: "rider",
+            },
+          };
+
+          await usersCollection.updateOne(userQuery, userUpdateDoc);
+        }
+        res.send(riderResult);
+      } catch (error) {
+        console.error("Approval error:", error);
+        res.status(500).send({ message: "Server error during approval" });
+      }
     });
 
     // ✅ NEW: GET /users/:uid - Fetch user by Firebase UID
@@ -408,7 +431,135 @@ async function run() {
         res.status(500).send({ message: "Internal server error" });
       }
     });
+
+    // user search api
+    // app.get("/users/search", async (req, res) => {
+    //   const email = req.query.email;
+    //   if (!email) return res.status(400).send({ message: "Email is required" });
+
+    //   const regex = new RegExp(email, "i");
+    //   try {
+    //     const users = await usersCollection
+    //       .find({ email: { regex: regex } })
+    //       .project({ email: 1, createdAt: 1, role: 1 })
+    //       .limit(10)
+    //       .toArray();
+    //     res.send(users);
+    //   } catch (error) {
+    //     console.error("Error searching users", error);
+    //     res.status(500).send({ message: "Error searching users" });
+    //   }
+    // });
+
+    // //patch api
+    // app.patch("/users/:id/role", async (req, res) => {
+    //   const { role } = req.body;
+    //   const { id } = req.params;
+
+    //   if (!["admin", "user", "rider"].includes(role)) {
+    //     return res.status(400).send({ message: "Invalid role" });
+    //   }
+
+    //   const result = await usersCollection.updateOne(
+    //     { _id: new ObjectId(id) },
+    //     { $set: { role } }
+    //   );
+
+    //   res.send(result);
+    // });
+
    
+    // Updated /users/search endpoint
+    app.get("/users/search", async (req, res) => {
+      const searchTerm = req.query.term || req.query.email; // Support both parameters
+      if (!searchTerm) {
+        return res.status(400).json({
+          success: false,
+          message: "Search term is required",
+        });
+      }
+
+      try {
+        const users = await usersCollection
+          .find({
+            $or: [
+              { email: { $regex: searchTerm, $options: "i" } },
+              { uid: { $regex: searchTerm, $options: "i" } },
+            ],
+          })
+          .project({
+            _id: 1,
+            email: 1,
+            uid: 1,
+            name: 1,
+            role: 1,
+            createdAt: 1,
+            last_log_in: 1,
+          })
+          .limit(10)
+          .toArray();
+
+        res.json({
+          success: true,
+          data: users,
+          count: users.length,
+        });
+      } catch (error) {
+        console.error("Search error:", error);
+        res.status(500).json({
+          success: false,
+          message: "Internal server error",
+        });
+      }
+    });
+
+    // Updated role update endpoint
+    app.patch("/users/:id/role", async (req, res) => {
+      const { id } = req.params;
+      const { role } = req.body;
+
+      // Validate input
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid user ID format",
+        });
+      }
+
+      if (!["admin", "user", "rider"].includes(role)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid role specified",
+        });
+      }
+
+      try {
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role } }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({
+            success: false,
+            message: "User not found",
+          });
+        }
+
+        res.send({
+          success: true,
+          message: "User role updated successfully",
+          data: result,
+        });
+      } catch (error) {
+        console.error("Error updating user role:", error);
+        res.status(500).send({
+          success: false,
+          message: "Failed to update user role",
+          error: error.message,
+        });
+      }
+    });
 
     // MongoDB connection test
     await client.db("admin").command({ ping: 1 });
